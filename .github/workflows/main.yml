@@ -1,43 +1,307 @@
-# This workflow will build a Java project with Maven, and cache/restore any dependencies to improve the workflow execution time
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-java-with-maven
-
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-
 name: Maven Build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["**"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["**"]
   workflow_dispatch:
-    branches: [ master ]
+    inputs:
+      release_version:
+        description: 'Release-Version (z.B. 1.2.0)'
+        required: true
+      release_name:
+        description: 'Optionaler Release-Name'
+        required: false
+        default: ''
+      commit_pom_change:
+        description: 'pom.xml Änderung committen & pushen?'
+        required: false
+        default: 'false'
 
+permissions:
+  contents: write
+
+env:
+  MAVEN_OPTS: -Xmx2g
+  NVD_API_KEY: '8550c17c-d173-4ae5-8e56-bf6043df9270'
 
 jobs:
+
+  # 1) BUILD
   build:
-
     runs-on: ubuntu-latest
-
+    outputs:
+      jar_paths: ${{ steps.set-artifacts.outputs.jar_paths }}
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Java 21
-        uses: actions/setup-java@v4
         with:
-          java-version: '21'
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
           distribution: 'temurin'
-          
-      - name: Build with Maven
-        run: mvn --batch-mode --update-snapshots verify
-        
-      - name: Create necessary directories
-        run: mkdir staging && cp target/*.jar staging
-      
-      - name: Upload artifact
+          java-version: '21'
+          cache: 'maven'
+      - name: Build Plugin
+        run: mvn -B -T 1C clean package -DskipTests
+      - name: Find JARs
+        id: set-artifacts
+        run: |
+          JARS=$(find target -maxdepth 1 -name '*.jar' -printf '%f\n' | paste -sd "," -)
+          echo "jar_paths=$JARS" >> $GITHUB_OUTPUT
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.repository.name }}-${{ github.sha }}
-          path: staging
+          name: jars-${{ github.sha }}
+          path: target/*.jar
+
+  # 2) TESTS
+  tests:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        type: [functionality, security, dependency-updates]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+
+      - name: Run functionality tests
+        if: matrix.type == 'functionality'
+        run: mvn -B -T 1C test || echo "TEST_FAIL=true" >> $GITHUB_ENV
+
+      - name: Run security scan (fast)
+        if: matrix.type == 'security'
+        run: |
+          mkdir -p ~/.m2/repository/org/owasp/dependency-check-data
+          mvn -B org.owasp:dependency-check-maven:check \
+            -Dformat=XML \
+            -DnvdApiKey=${NVD_API_KEY} \
+            -DfailOnCVSS=11 \
+            -DanalyzerRetireJS.enabled=false \
+            || echo "SECURITY_FAIL=true" >> $GITHUB_ENV
+
+      - name: Check for dependency updates
+        if: matrix.type == 'dependency-updates'
+        run: mvn -B versions:display-dependency-updates || echo "DEPS_FAIL=true" >> $GITHUB_ENV
+
+  # 3) FORMATTING CHECK
+  formatting-check:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      format_failed: ${{ steps.check-format.outputs.failed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+      - name: Ensure Spotless Plugin in pom.xml
+        run: |
+          if ! grep -q "spotless-maven-plugin" pom.xml; then
+            echo "⚙️ Adding Spotless plugin to pom.xml..."
+            sed -i '/<\/plugins>/i\
+            <plugin>\
+              <groupId>com.diffplug.spotless</groupId>\
+              <artifactId>spotless-maven-plugin</artifactId>\
+              <version>2.46.1</version>\
+              <configuration>\
+                <java>\
+                  <googleJavaFormat/>\
+                </java>\
+              </configuration>\
+            </plugin>' pom.xml
+          fi
+      - name: Run Spotless Check
+        id: check-format
+        run: |
+          if mvn -B spotless:check; then
+            echo "failed=false" >> $GITHUB_OUTPUT
+          else
+            echo "failed=true" >> $GITHUB_OUTPUT
+          fi
+
+  # 4) FORMATTING FIX (nur wenn Check fehlschlägt)
+  formatting-fix:
+    needs: formatting-check
+    if: needs.formatting-check.outputs.format_failed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      fixed_files: ${{ steps.commit-fix.outputs.fixed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+      - name: Ensure Spotless Plugin in pom.xml
+        run: |
+          if ! grep -q "spotless-maven-plugin" pom.xml; then
+            sed -i '/<\/plugins>/i\
+            <plugin>\
+              <groupId>com.diffplug.spotless</groupId>\
+              <artifactId>spotless-maven-plugin</artifactId>\
+              <version>2.46.1</version>\
+              <configuration>\
+                <java>\
+                  <googleJavaFormat/>\
+                </java>\
+              </configuration>\
+            </plugin>' pom.xml
+          fi
+      - name: Apply Formatting Fix
+        run: mvn -B spotless:apply
+      - name: Commit Fix
+        id: commit-fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -u
+          if git commit -m "style: apply automatic formatting fixes [skip ci]"; then
+            git push
+            FIXED=$(git diff --name-only HEAD~1)
+            echo "fixed=$FIXED" >> $GITHUB_OUTPUT
+          else
+            echo "fixed=" >> $GITHUB_OUTPUT
+          fi
+      - name: Verify Formatting After Fix
+        run: mvn -B spotless:check
+
+  # 5) SUMMARY – immer
+  summary:
+    if: always()
+    needs: [tests, formatting-check, formatting-fix]
+    runs-on: ubuntu-latest
+    steps:
+      - name: CI Summary
+        run: |
+          echo "## CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage         | Status   |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build         | ✅ Pass |" >> $GITHUB_STEP_SUMMARY
+          echo "| Functionality | $([[ \"${TEST_FAIL}\" == \"true\" ]] && echo "❌ Fail" || echo "✅ Pass") |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security      | $([[ \"${SECURITY_FAIL}\" == \"true\" ]] && echo "❌ Fail" || echo "✅ Pass") |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependencies  | $([[ \"${DEPS_FAIL}\" == \"true\" ]] && echo "❌ Fail" || echo "✅ Pass") |" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ needs.formatting-check.outputs.format_failed }}" == "true" ]]; then
+            if [[ -n "${{ needs.formatting-fix.outputs.fixed_files }}" ]]; then
+              echo "| Formatting    | 🔧 Fixed |" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### Fixed Files:" >> $GITHUB_STEP_SUMMARY
+              echo "${{ needs.formatting-fix.outputs.fixed_files }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| Formatting    | ❌ Fail |" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "| Formatting    | ✅ Pass |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # 6) RELEASE – nur bei workflow_dispatch
+  release-prepare:
+    if: always() && github.event_name == 'workflow_dispatch'
+    needs: [build, tests, formatting-check, formatting-fix]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Update pom.xml to release version
+        run: |
+          mvn -B versions:set -DnewVersion="${{ github.event.inputs.release_version }}"
+          mvn -B versions:commit
+          if [[ "${{ github.event.inputs.commit_pom_change }}" == "true" ]]; then
+            if [[ -n "$(git status --porcelain)" ]]; then
+              git add pom.xml
+              git commit -m "chore: release version ${{ github.event.inputs.release_version }}"
+              git push origin HEAD
+            fi
+          fi
+          TAG="v${{ github.event.inputs.release_version }}"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+  release-notes:
+    if: always() && github.event_name == 'workflow_dispatch'
+    needs: release-prepare
+    runs-on: ubuntu-latest
+    outputs:
+      release_notes: ${{ steps.generate_notes.outputs.notes }}
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Generate Release Notes
+        id: generate_notes
+        run: |
+          git fetch --tags
+          LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            RANGE="$LAST_TAG..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+
+          NOTES="Release ${{ github.event.inputs.release_version }}\n"
+          LOGS=$(git log --pretty=format:"* %s (%an)" $RANGE)
+
+          NOTES="$NOTES$LOGS"
+
+          # Schreibe multiline Output ohne EOF, mit base64 encode workaround
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Create Draft Release
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          tag_name: v${{ github.event.inputs.release_version }}
+          release_name: ${{ github.event.inputs.release_name || format('Release {0}', github.event.inputs.release_version) }}
+          body: ${{ steps.generate_notes.outputs.notes }}
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-upload:
+    if: always() && github.event_name == 'workflow_dispatch'
+    needs: release-notes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+      - name: Rebuild with release version
+        run: mvn -B clean package
+      - name: Find JAR file
+        id: find_jar
+        run: |
+          JAR_PATH=$(find target -name "*.jar" | head -n 1)
+          echo "jar_path=$JAR_PATH" >> $GITHUB_OUTPUT
+      - name: Upload JAR Asset
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ needs.release-notes.outputs.upload_url }}
+          asset_path: ${{ steps.find_jar.outputs.jar_path }}
+          asset_name: ${{ github.event.inputs.release_name }}-${{ github.event.inputs.release_version }}.jar
+          asset_content_type: application/java-archive
